@@ -1,0 +1,1088 @@
+diff --git a/omniserve/block.py b/omniserve/block.py
+index 56ec897..7fb5ebe 100644
+--- a/omniserve/block.py
++++ b/omniserve/block.py
+@@ -57,12 +57,13 @@ class PhysicalTokenBlock:
+         device: Device,
+         block_number: int,
+         block_size: int,
++        ref_count:int = 0,
+     ) -> None:
+         self.device = device
+         self.block_number = block_number
+         self.block_size = block_size
+ 
+-        self.ref_count = 0
++        self.ref_count = ref_count
+ 
+     def __repr__(self) -> str:
+         return (
+diff --git a/omniserve/config.py b/omniserve/config.py
+index 5dc516d..5c13c28 100644
+--- a/omniserve/config.py
++++ b/omniserve/config.py
+@@ -220,6 +220,7 @@ class CacheConfig:
+         self.num_retrieval_cpu_blocks = None
+         self.num_streaming_gpu_blocks = None
+         self.num_streaming_cpu_blocks = None
++        self.use_kv_slab = False
+ 
+     def _verify_args(self) -> None:
+         if self.gpu_memory_utilization > 1.0:
+@@ -278,6 +279,7 @@ class ParallelConfig:
+         self.disable_custom_all_reduce = disable_custom_all_reduce
+ 
+         self.world_size = pipeline_parallel_size * tensor_parallel_size
++        self.rank = 0
+         self._verify_args()
+ 
+     def _verify_args(self) -> None:
+diff --git a/omniserve/core/block_manager.py b/omniserve/core/block_manager.py
+index b1453e7..43d9cd7 100644
+--- a/omniserve/core/block_manager.py
++++ b/omniserve/core/block_manager.py
+@@ -18,7 +18,10 @@ from omniserve.block import BlockTable, PhysicalTokenBlock
+ from omniserve.sequence import Sequence, SequenceGroup, SequenceStatus
+ from omniserve.utils.utils import Device
+ from omniserve.attn_config import SpAttnConfig
++from omniserve.config import CacheConfig
++from omniserve.logger import init_logger
+ 
++logger = init_logger(__name__)
+ 
+ class BlockAllocator:
+     """Manages free physical token blocks for a device.
+@@ -64,6 +67,196 @@ class BlockAllocator:
+         return len(self.free_blocks)
+ 
+ 
++class ElasticBlockAllocator:
++    """Manages free physical token blocks for a device.
++
++    kvcached-backed block allocator
++    """
++
++    def __init__(
++        self,
++        device: Device,
++        block_size: int,
++        num_blocks: int,
++        cache_config: CacheConfig,
++    ) -> None:
++        
++        assert isinstance(num_blocks, int) and num_blocks > 0
++        assert isinstance(cache_config, CacheConfig)
++        assert hasattr(cache_config, "engine_id")
++        assert hasattr(cache_config, "kv_slab_socket")
++        assert hasattr(cache_config, "block_byte_size")
++        
++        self.device = device
++        self.block_size = block_size ### How to calulate it?
++        self.num_blocks = num_blocks
++        self.cache_config = cache_config
++        self.block_byte_size = getattr(self.cache_config, "block_byte_size")
++
++        self.socket = getattr(self.cache_config, "kv_slab_socket")
++        self.engine_id = getattr(self.cache_config, "engine_id")
++
++        from collections import deque
++        self.local_free_blocks: deque[int] = deque()
++        self.refill_size = 64
++
++        self.cache_high_watermark = self.refill_size * 2
++        self.return_batch_size = self.refill_size // 2
++        self.last_known_manager_free_blocks = 0
++        self._sync_num_free_blocks()
++    
++    def shutdown(self):
++        if self._is_shutdown:
++            return
++        
++        if self.local_free_blocks:
++            remaining_blocks = list(self.local_free_blocks)
++            self.local_free_blocks.clear()
++
++            logger.info(f"Engine {self.engine_id}: Returning {len(remaining_blocks)} "
++                        f"cached blocks to the manager upon shutdown.")
++            
++            try:
++                self._free(remaining_blocks)
++            except Exception as e:
++                logger.error(f"Engine {self.engine_id}: Failed to return blocks during shutdown: {e}")
++        
++        self._is_shutdown = True
++    
++    def __del__(self):
++        self.shutdown()
++
++    def _sync_num_free_blocks(self):
++        try:
++            self.socket.send_pyobj((self.engine_id, "get_num_free_blocks", self.block_byte_size))
++            num_free_blocks = self.socket.recv_pyobj()
++            if isinstance(num_free_blocks, int):
++                self.last_known_manager_free_blocks = num_free_blocks
++        except Exception as e:
++            logger.error(f"Engine {self.engine_id}: Failed to sync free blocks from KVSlabManager: {e}")
++            self.last_known_manager_free_blocks = 0
++
++    def allocate(self, num_blocks=1) -> PhysicalTokenBlock:
++        """Get new blocks from the free block pool.
++        Note that we do not check block cache in this function.
++        Args:
++            num_blocks: The number of blocks to allocate.
++        Returns:
++            A list of new block.
++        """
++
++        if len(self.local_free_blocks) < num_blocks:
++            num_to_request = max(num_blocks, self.refill_size)
++
++            self.socket.send_pyobj((self.engine_id, "alloc", (self.block_byte_size, num_to_request)))
++            block_ids, num_free_blocks = self.socket.recv_pyobj()
++
++            if block_ids is None:
++                return None
++            
++            self.last_known_manager_free_blocks = num_free_blocks
++            self.local_free_blocks.extend(block_ids)
++
++        block_ids = []
++        for _ in range(num_blocks):
++            block_ids.append(self.local_free_blocks.popleft())
++        
++        if block_ids is None:
++            return None
++        assert len(block_ids) == num_blocks
++        if num_blocks == 1:
++            return PhysicalTokenBlock(
++                        device=self.device, 
++                        block_number=block_ids[0], 
++                        block_size=self.block_size,
++                        ref_count=1,
++                                    )
++        else:
++            return [PhysicalTokenBlock(
++                        device=self.device, 
++                        block_number=bid, 
++                        block_size=self.block_size,
++                        ref_count=1,
++                                    ) for bid in block_ids]
++    
++    def free(self, block: PhysicalTokenBlock) -> None:
++        """Free block or a list of blocks. The blocks should be ordered by their
++        eviction priority, where the first block will be evicted first.
++
++        Args:
++            block: A list of blocks to free ordered by their eviction
++                priority.
++        """
++        freed_block_numbers = []
++        blocks_to_process = block if isinstance(block, list) else [block]
++
++        for blk in blocks_to_process:
++            if blk.ref_count == 0:
++                raise ValueError(f"Double free! {block} is already freed.")
++            blk.ref_count -= 1
++            if blk.ref_count == 0:
++                freed_block_numbers.append(blk.block_number)
++        
++        if not freed_block_numbers:
++            return
++        
++        self.local_free_blocks.extend(freed_block_numbers)
++
++        if len(self.local_free_blocks) > self.cache_high_watermark:
++            blocks_to_return = []
++            num_to_return = min(self.return_batch_size, len(self.local_free_blocks))
++
++            for _ in range(num_to_return):
++                blocks_to_return.append(self.local_free_blocks.pop())
++
++            if blocks_to_return:
++                self._free(blocks_to_return)
++
++        # if isinstance(block, list):
++        #     free_block_ids = []
++        #     for blk in block:
++        #         if blk.ref_count == 0:
++        #             raise ValueError(f"Double free! {block} is already freed.")
++        #         blk.ref_count -= 1
++        #         if blk.ref_count == 0: 
++        #             free_block_ids.append(blk.block_number)
++        #     self._free(free_block_ids)
++        # else:
++
++        #     if block.ref_count == 0:
++        #         raise ValueError(f"Double free! {block} is already freed.")
++        #     block.ref_count -= 1
++        #     if block.ref_count == 0: 
++        #         self._free([block.block_number])
++        
++    def _free(self, block_ids):
++        """Free a list of blocks. The blocks should be ordered by their
++        eviction priority, where the first block will be evicted first.
++        Args:
++            ordered_blocks: A list of blocks to free ordered by their eviction
++                priority.
++        """
++        if len(block_ids) > 0:
++            # self.kv_cache_manager.free(block_ids)
++            self.socket.send_pyobj((self.engine_id, "free", (self.block_byte_size, block_ids)))
++            manager_free_count = self.socket.recv_pyobj()
++            if isinstance(manager_free_count, int):
++                self.last_known_manager_free_blocks = manager_free_count
++    
++    def get_num_free_blocks(self) -> int:
++        """Get the number of free blocks in the pool.
++        Returns:
++            The number of free blocks.
++        """
++        # self.socket.send_pyobj((self.engine_id, "get_num_free_blocks", self.block_byte_size))
++        # num_free_blocks = self.socket.recv_pyobj()
++        
++        # return num_free_blocks
++        # return num_free_blocks + len(self.local_free_blocks)
++        return self. last_known_manager_free_blocks + len(self.local_free_blocks)
++        
++
++
+ class AllocStatus(enum.Enum):
+     """Result for BlockSpaceManager.can_allocate
+ 
+@@ -89,6 +282,7 @@ class BaseBlockSpaceManager:
+         num_cpu_blocks: int,
+         watermark: float = 0.01,
+         sink_local_blocks: Optional[Tuple[int, int]] = None,
++        cache_config: CacheConfig = None,
+     ) -> None:
+         self.block_size = block_size
+         self.num_total_gpu_blocks = num_gpu_blocks
+@@ -105,7 +299,13 @@ class BaseBlockSpaceManager:
+         assert watermark >= 0.0
+ 
+         self.watermark_blocks = int(watermark * num_gpu_blocks)
+-        self.gpu_allocator = BlockAllocator(Device.GPU, block_size, num_gpu_blocks)
++        
++        
++        if cache_config is not None and cache_config.use_kv_slab:
++            self.gpu_allocator = ElasticBlockAllocator(Device.GPU, block_size, num_gpu_blocks, cache_config)
++        else:
++            self.gpu_allocator = BlockAllocator(Device.GPU, block_size, num_gpu_blocks)
++        
+         self.cpu_allocator = BlockAllocator(Device.CPU, block_size, num_cpu_blocks)
+         # Mapping: seq_id -> BlockTable.
+         self.block_tables: Dict[int, BlockTable] = {}
+@@ -164,19 +364,36 @@ class BaseBlockSpaceManager:
+             for block in prefix.block_table:
+                 block.ref_count += seq_group.num_seqs()
+                 block_table.append(block)
+-        # print("################# num_prompt_blocks", num_prompt_blocks)
+-        for logical_idx in range(num_prompt_blocks):
+-            if (
+-                self.streaming_enabled 
+-                and logical_idx >= self.block_sink_window + self.block_local_window
+-            ):
+-                block = block_table[self.block_sink_window + (logical_idx - self.block_sink_window) % self.block_local_window]
+-            else:
+-                block = self.gpu_allocator.allocate()
+-            # Set the reference counts of the token blocks.
+-            block.ref_count = seq_group.num_seqs()
+-            block_table.append(block)
+-            # print("logical_idx", logical_idx, "block", block, "block_table", block_table)
++        
++        if isinstance(self.gpu_allocator, BlockAllocator):
++            # print("################# num_prompt_blocks", num_prompt_blocks)
++            for logical_idx in range(num_prompt_blocks):
++                if (
++                    self.streaming_enabled 
++                    and logical_idx >= self.block_sink_window + self.block_local_window
++                ):
++                    block = block_table[self.block_sink_window + (logical_idx - self.block_sink_window) % self.block_local_window]
++                else:
++                    block = self.gpu_allocator.allocate()
++                # Set the reference counts of the token blocks.
++                block.ref_count = seq_group.num_seqs()
++                block_table.append(block)
++                # print("logical_idx", logical_idx, "block", block, "block_table", block_table)
++        elif isinstance(self.gpu_allocator, ElasticBlockAllocator):
++            if num_prompt_blocks > 0:
++                new_blocks = self.gpu_allocator.allocate(num_blocks=num_prompt_blocks)
++
++                if new_blocks is None:
++                    raise ValueError(f"Failed to allocate {num_prompt_blocks} blocks.")
++
++                if isinstance(new_blocks, PhysicalTokenBlock):
++                    new_blocks.ref_count = seq_group.num_seqs()
++                    block_table.append(new_blocks)
++                else:
++                    for block in new_blocks:
++                        block.ref_count = seq_group.num_seqs()
++                
++                    block_table.extend(new_blocks)
+ 
+         if prefix is not None and not prefix.allocated:
+             # Allocate blocks for the prefix, we will compute the prefix's
+@@ -378,6 +595,7 @@ class BlockSpaceManager:
+         num_streaming_gpu_blocks: int,
+         num_streaming_cpu_blocks: int,
+         sp_attn_config: SpAttnConfig,
++        cache_config: CacheConfig = None,
+         watermark: float = 0.01,
+     ) -> None:
+         self.block_size = block_size
+@@ -393,7 +611,8 @@ class BlockSpaceManager:
+             block_size, 
+             num_retrieval_gpu_blocks, 
+             num_retrieval_cpu_blocks, 
+-            watermark
++            watermark,
++            cache_config=cache_config,
+         )
+         self.streaming_blockspace_manager = None
+         if self.sparse_kv_cache_enabled:
+@@ -402,7 +621,8 @@ class BlockSpaceManager:
+                 num_streaming_gpu_blocks, 
+                 num_streaming_cpu_blocks, 
+                 watermark, 
+-                (sp_attn_config.get_dec_sink_block_num(), sp_attn_config.get_dec_local_block_num()) # add by JXGuo: one more local block for future design
++                (sp_attn_config.get_dec_sink_block_num(), sp_attn_config.get_dec_local_block_num()), # add by JXGuo: one more local block for future design
++                cache_config=cache_config,
+             )
+ 
+     def can_allocate(
+diff --git a/omniserve/core/scheduler.py b/omniserve/core/scheduler.py
+index 5ea223e..f9d7770 100644
+--- a/omniserve/core/scheduler.py
++++ b/omniserve/core/scheduler.py
+@@ -16,7 +16,7 @@ from collections import deque
+ from typing import Deque, Dict, Iterable, List, Optional, Tuple, Union
+ 
+ from omniserve.config import CacheConfig, IFBConfig, SchedulerConfig
+-from omniserve.core.block_manager import AllocStatus, BlockSpaceManager
++from omniserve.core.block_manager import AllocStatus, BlockSpaceManager, ElasticBlockAllocator
+ from omniserve.core.policy import PolicyFactory
+ from omniserve.logger import init_logger
+ from omniserve.prefix import PrefixPool
+@@ -115,6 +115,7 @@ class Scheduler:
+             num_streaming_gpu_blocks=self.cache_config.num_streaming_gpu_blocks,
+             num_streaming_cpu_blocks=self.cache_config.num_streaming_cpu_blocks,
+             sp_attn_config=self.cache_config.sp_attn_config,
++            cache_config=self.cache_config,
+         )
+ 
+         # Create the prefix pool to cache the prefixes.
+@@ -127,6 +128,8 @@ class Scheduler:
+         # Sequence groups in the SWAPPED state.
+         self.swapped: Deque[SequenceGroup] = deque()
+ 
++        self.use_kv_slab = isinstance(self.block_manager.retrieval_blockspace_manager.gpu_allocator, ElasticBlockAllocator)
++
+     def add_seq_group(self, seq_group: SequenceGroup) -> None:
+         # Add sequence groups to the waiting queue.
+         self.waiting.append(seq_group)
+@@ -199,6 +202,11 @@ class Scheduler:
+             )
+             seq_lens: List[int] = []
+ 
++            if self.use_kv_slab:
++                # kmbin add
++                num_free_gpu_blocks = self.block_manager.get_retrieval_num_free_gpu_blocks()
++                gpu_blocks_budget = num_free_gpu_blocks - self.block_manager.retrieval_blockspace_manager.watermark_blocks
++
+             # Optimization: We do not sort the waiting queue since the preempted
+             # sequence groups are added to the front and the new sequence groups
+             # are added to the back.
+@@ -220,23 +228,47 @@ class Scheduler:
+                     ignored_seq_groups.append(seq_group)
+                     self.waiting.popleft()
+                     continue
++                
++                # kmbin add
++                if self.use_kv_slab:
++                    seq = waiting_seqs[0]
++                    num_required_blocks = len(seq.logical_token_blocks)
++                    if self.init_num_blocks is not None:
++                        num_required_blocks = max(self.init_num_blocks, num_required_blocks)
++                    if seq_group.prefix is not None and seq_group.prefix.allocated:
++                        num_required_blocks -= seq_group.prefix.get_num_blocks()
++
++                    if self.block_manager.num_total_retrieval_gpu_blocks < num_required_blocks:
++                        logger.warning(
++                            f"Input prompt ({num_prompt_tokens} tokens) is too long"
++                            f" and exceeds the capacity of block_manager"
++                        )
++                        for seq in waiting_seqs:
++                            seq.status = SequenceStatus.FINISHED_IGNORED
++                        ignored_seq_groups.append(seq_group)
++                        self.waiting.popleft()
++                        continue
+ 
+-                # If the sequence group cannot be allocated, stop.
+-                can_allocate = self.block_manager.can_allocate(
+-                    seq_group, self.ifb_mode, self.init_num_blocks
+-                )
+-                if can_allocate == AllocStatus.LATER:
+-                    break
+-                elif can_allocate == AllocStatus.NEVER:
+-                    logger.warning(
+-                        f"Input prompt ({num_prompt_tokens} tokens) is too long"
+-                        f" and exceeds the capacity of block_manager"
++                    if gpu_blocks_budget < num_required_blocks:
++                        break
++                else:
++
++                    # If the sequence group cannot be allocated, stop.
++                    can_allocate = self.block_manager.can_allocate(
++                        seq_group, self.ifb_mode, self.init_num_blocks
+                     )
+-                    for seq in waiting_seqs:
+-                        seq.status = SequenceStatus.FINISHED_IGNORED
+-                    ignored_seq_groups.append(seq_group)
+-                    self.waiting.popleft()
+-                    continue
++                    if can_allocate == AllocStatus.LATER:
++                        break
++                    elif can_allocate == AllocStatus.NEVER:
++                        logger.warning(
++                            f"Input prompt ({num_prompt_tokens} tokens) is too long"
++                            f" and exceeds the capacity of block_manager"
++                        )
++                        for seq in waiting_seqs:
++                            seq.status = SequenceStatus.FINISHED_IGNORED
++                        ignored_seq_groups.append(seq_group)
++                        self.waiting.popleft()
++                        continue
+ 
+                 # If the number of batched tokens exceeds the limit, stop.
+                 new_seq_lens = seq_lens + [num_prompt_tokens]
+@@ -257,6 +289,10 @@ class Scheduler:
+                 #     break
+                 seq_lens = new_seq_lens
+ 
++                # kmbin add
++                if self.use_kv_slab:
++                    gpu_blocks_budget -= num_required_blocks
++
+                 self.waiting.popleft()
+                 self._allocate(seq_group)
+                 self.running.append(seq_group)
+@@ -286,28 +322,61 @@ class Scheduler:
+         # groups to preempt.
+         self.running = self.policy.sort_by_priority(now, self.running)
+ 
+-        # Reserve new token slots for the running sequence groups.
+-        running: Deque[SequenceGroup] = deque()
+-        preempted: List[SequenceGroup] = []
+-        while self.running:
+-            seq_group = self.running.popleft()
+-            while not self.block_manager.can_append_slot(seq_group):
+-                if self.running:
+-                    # Preempt the lowest-priority sequence groups.
+-                    victim_seq_group = self.running.pop()
+-                    self._preempt(victim_seq_group, retrieval_blocks_to_swap_out=retrieval_blocks_to_swap_out, streaming_blocks_to_swap_out=streaming_blocks_to_swap_out)
++        # NOTE(kmbin): Modifying this to reduce frequent can_append_slot()
++        if self.use_kv_slab:
++            num_running_seqs = sum(
++                seq_group.num_seqs(status=SequenceStatus.RUNNING)
++                for seq_group in self.running
++            )
++            num_free_gpu_blocks = self.block_manager.get_retrieval_num_free_gpu_blocks()
++
++            deficit = num_running_seqs - num_free_gpu_blocks
++
++            preempted: List[SequenceGroup] = []
++            if deficit > 0:
++                num_freed_blocks = 0
++                running_list = list(self.running)
++                self.running.clear()
++
++                while num_freed_blocks < deficit and running_list:
++                    victim_seq_group = running_list.pop()
++                    num_freed_blocks += victim_seq_group.num_seqs(status=SequenceStatus.RUNNING)
++
++                    self._preempt(victim_seq_group, retrieval_blocks_to_swap_out=retrieval_blocks_to_swap_out,
++                                streaming_blocks_to_swap_out=streaming_blocks_to_swap_out)
+                     preempted.append(victim_seq_group)
+-                else:
+-                    # No other sequence groups can be preempted.
+-                    # Preempt the current sequence group.
+-                    self._preempt(seq_group, retrieval_blocks_to_swap_out=retrieval_blocks_to_swap_out, streaming_blocks_to_swap_out=streaming_blocks_to_swap_out)
+-                    preempted.append(seq_group)
+-                    break
+-            else:
+-                # Append new slots to the sequence group.
+-                self._append_slot(seq_group, retrieval_blocks_to_copy=retrieval_blocks_to_copy, streaming_blocks_to_copy=streaming_blocks_to_copy)
++                
++                self.running.extend(running_list)
++            running: Deque[SequenceGroup] = deque()
++            while self.running:
++                seq_group = self.running.popleft()
++                self._append_slot(seq_group, retrieval_blocks_to_copy=retrieval_blocks_to_copy,
++                                streaming_blocks_to_copy=streaming_blocks_to_copy)
+                 running.append(seq_group)
+-        self.running = running
++            self.running = running
++        else:
++            # Reserve new token slots for the running sequence groups.
++            running: Deque[SequenceGroup] = deque()
++            preempted: List[SequenceGroup] = []
++            while self.running:
++                seq_group = self.running.popleft()
++                while not self.block_manager.can_append_slot(seq_group):
++                    if self.running:
++                        # Preempt the lowest-priority sequence groups.
++                        victim_seq_group = self.running.pop()
++                        self._preempt(victim_seq_group, retrieval_blocks_to_swap_out=retrieval_blocks_to_swap_out, streaming_blocks_to_swap_out=streaming_blocks_to_swap_out)
++                        preempted.append(victim_seq_group)
++                    else:
++                        # No other sequence groups can be preempted.
++                        # Preempt the current sequence group.
++                        self._preempt(seq_group, retrieval_blocks_to_swap_out=retrieval_blocks_to_swap_out, streaming_blocks_to_swap_out=streaming_blocks_to_swap_out)
++                        preempted.append(seq_group)
++                        break
++                else:
++                    # Append new slots to the sequence group.
++                    self._append_slot(seq_group, retrieval_blocks_to_copy=retrieval_blocks_to_copy, streaming_blocks_to_copy=streaming_blocks_to_copy)
++                    running.append(seq_group)
++            self.running = running
+ 
+         # Swap in the sequence groups in the SWAPPED state if possible.
+         self.swapped = self.policy.sort_by_priority(now, self.swapped)
+diff --git a/omniserve/engine/arg_utils.py b/omniserve/engine/arg_utils.py
+index d4a58c0..94e76b0 100644
+--- a/omniserve/engine/arg_utils.py
++++ b/omniserve/engine/arg_utils.py
+@@ -12,7 +12,7 @@
+ # }
+ import argparse
+ import dataclasses
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Optional, Tuple
+ import os
+ import torch
+@@ -92,6 +92,9 @@ class EngineArgs:
+     dynamic_sparse_token_budget: int = 4096
+     selector_update_interval: int = 4
+     multiblock_switch: int = 2048
++    kv_slab_size: int = 2 * 1024 * 1024
++    kv_slab_host: Optional[str] = "localhost"
++    kv_slab_ports: Optional[list[int]] = field(default_factory=lambda: list(range(5555, 5555+8)))
+ 
+     def __post_init__(self):
+         if self.tokenizer is None:
+@@ -555,7 +558,7 @@ class EngineArgs:
+             self.kv_cache_bits = 4
+ 
+         cache_config = CacheConfig(
+-            self.block_size,
++            self.block_size, # 64 supported only
+             self.gpu_memory_utilization,
+             self.swap_space,
+             self.kv_cache_dtype,
+@@ -563,6 +566,14 @@ class EngineArgs:
+             model_config.get_sliding_window(),
+         )
+         
++        use_kv_slab = bool(int(os.getenv("VLLM_USE_KV_SLAB",'0')))
++        cache_config.use_kv_slab = use_kv_slab
++
++        if use_kv_slab:
++            cache_config.kv_slab_size = self.kv_slab_size
++            cache_config.kv_slab_ports = self.kv_slab_ports
++            cache_config.kv_slab_host = self.kv_slab_host
++        
+         # add sp_attn_config to cache_config and model_config
+         model_config.sp_attn_config = sp_attn_config
+         cache_config.sp_attn_config = sp_attn_config
+diff --git a/omniserve/engine/llm_engine.py b/omniserve/engine/llm_engine.py
+index 7937021..ddc5f93 100644
+--- a/omniserve/engine/llm_engine.py
++++ b/omniserve/engine/llm_engine.py
+@@ -48,6 +48,8 @@ from omniserve.utils.utils import (
+ logger = init_logger(__name__)
+ _LOCAL_LOGGING_INTERVAL_SEC = 5
+ 
++_QSERVE_VIA_VLLM = bool(int(os.getenv('QSERVE_VIA_VLLM', 0)))
++
+ 
+ class LLMEngine:
+     """An LLM engine that receives requests and generates texts.
+@@ -323,6 +325,30 @@ class LLMEngine:
+             >>> ...
+         """
+ 
++        if _QSERVE_VIA_VLLM:
++            vllm_sp = sampling_params
++            sampling_params = SamplingParams(
++                n=vllm_sp.n,
++                best_of=vllm_sp.best_of,
++                presence_penalty=vllm_sp.presence_penalty,
++                frequency_penalty=vllm_sp.frequency_penalty,
++                repetition_penalty=vllm_sp.repetition_penalty,
++                temperature=vllm_sp.temperature,
++                top_p=vllm_sp.top_p,
++                top_k=-1 if vllm_sp.top_k < 1 else vllm_sp.top_k,
++                min_p=vllm_sp.min_p,
++                stop=vllm_sp.stop,
++                stop_token_ids=vllm_sp.stop_token_ids,
++                include_stop_str_in_output=vllm_sp.include_stop_str_in_output,
++                ignore_eos=vllm_sp.ignore_eos,
++                max_tokens=vllm_sp.max_tokens,
++                logprobs=vllm_sp.logprobs,
++                prompt_logprobs=vllm_sp.prompt_logprobs,
++                skip_special_tokens=vllm_sp.skip_special_tokens,
++                spaces_between_special_tokens=vllm_sp.spaces_between_special_tokens,
++                logits_processors=vllm_sp.logits_processors,
++            )
++
+         if arrival_time is None:
+             arrival_time = time.monotonic()
+ 
+@@ -333,7 +359,6 @@ class LLMEngine:
+                 prompt_token_ids=prompt_token_ids,
+             )
+             prompt_len = len(prompt_token_ids)
+-            print(f"prompt_len: {prompt_len}")
+         else:
+             # profiling mode
+             prompt_len = profiling_config.prompt_len
+@@ -558,7 +583,8 @@ class LLMEngine:
+                 # output = all_outputs[0]
+             else:
+                 output = []
+-            out = self._process_model_outputs(output, self.scheduler_outputs)
++            if not _QSERVE_VIA_VLLM:
++                output = self._process_model_outputs(output, self.scheduler_outputs)
+         else:
+             # TODO (shang): Without ifb mode, implement how to decode
+             # Execute the model.
+@@ -583,13 +609,15 @@ class LLMEngine:
+                 ifb_mode=self.ifb_mode,
+             )
+             output = all_outputs[0].cpu().numpy().tolist()
+-            if self.benchmarking_mode:
+-                out = self._process_model_outputs_benchmark(
+-                    output, self.scheduler_outputs
+-                )
+-            else:
+-                out = self._process_model_outputs(output, self.scheduler_outputs)
+-        return out
++            if not _QSERVE_VIA_VLLM:
++                if self.benchmarking_mode:
++                    output = self._process_model_outputs_benchmark(
++                        output, self.scheduler_outputs
++                    )
++                else:
++                    output = self._process_model_outputs(output, self.scheduler_outputs)
++        
++        return output
+ 
+     def _check_stop(self, seq: Sequence, sampling_params: SamplingParams) -> None:
+         """Stop the finished sequences."""
+diff --git a/omniserve/worker/cache_engine.py b/omniserve/worker/cache_engine.py
+index f654940..e70064b 100644
+--- a/omniserve/worker/cache_engine.py
++++ b/omniserve/worker/cache_engine.py
+@@ -314,3 +314,231 @@ class CacheEngine:
+ 
+ def _get_dtype_size(dtype: torch.dtype) -> int:
+     return torch.tensor([], dtype=dtype).element_size()
++
++
++class ElasticCacheEngine:
++    """Manages the KV cache.
++
++    This class is responsible for initializing and managing the GPU and CPU KV
++    caches. It also provides methods for performing KV cache operations, such
++    as swapping and copying.
++    """
++
++    def __init__(
++        self,
++        cache_config: CacheConfig,
++        model_config: ModelConfig,
++        parallel_config: ParallelConfig,
++        kv_cache_config: Dict,  # INT4_ENABLED: Whether to use int4 for kv_cache, ZEROS_ENABLED: Whether to use zero point for kv_cache
++    ) -> None:
++        self.cache_config = cache_config
++        self.model_config = model_config
++        self.parallel_config = parallel_config
++        
++        self.num_layers = model_config.get_num_layers(parallel_config)
++        # how many channel for one head
++        self.head_size = model_config.get_head_size()
++        self.num_heads = model_config.sp_attn_config.retrieval_head_num(0) # TODO get more generalized num_heads.
++        
++        self.block_size = cache_config.block_size
++        # self.num_gpu_blocks = cache_config.num_retrieval_gpu_blocks
++        # self.num_cpu_blocks = cache_config.num_retrieval_cpu_blocks
++
++        if cache_config.cache_dtype == "auto":
++            self.dtype = model_config.dtype
++        else:
++            self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
++            
++        self.elements_per_block = prod(self.get_key_block_shape()) #  (self.num_heads, self.block_size, self.head_size)
++        
++        # k and v (*2), 2 bytes per unit (*2)
++        self.num_bytes_per_block = self.elements_per_block // (
++            2 if kv_cache_config["INT4_ENABLED"] else 1
++        ) + self.block_size * self.num_heads * (
++            4 # if kv_cache_config["ZEROS_ENABLED"] else 2  # TODO: Fix this error for buffer offset (ctx pooling).
++        )
++        
++        self.sparse_decode_mode = model_config.sp_attn_config.get_sparse_decode_mode()      # default 1      
++        self.sub_chunk_per_block = model_config.sp_attn_config.get_dec_sub_chunk_per_block()     # number of sub-chunks per block # default 4
++
++        assert self.sub_chunk_per_block > 0 and self.block_size % self.sub_chunk_per_block == 0, f"Invalid sub_chunk_per_block: {self.sub_chunk_per_block}"
++        
++        self.num_bytes_k_stats_per_block = (2 * (self.sparse_decode_mode != 0)) * self.sub_chunk_per_block * self.num_heads * self.head_size * 2
++        # The first 2 in (2 * (self.sparse_decode_mode != 0)) is because we have min-max stats, the second 2 is because we have 2 bytes per fp16 element
++        
++        if kv_cache_config["INT4_ENABLED"]:
++            assert kv_cache_config[
++                "ZEROS_ENABLED"
++            ], "INT4 KV Cache must be used with Zero Points."
++            print("[INFO] USE INT4 w/ ZERO_POINTS for KV CACHE")
++        else:
++            # assert kv_cache_config[
++            #     "ZEROS_ENABLED"
++            # ], "INT8 KV Cache must be used with Zero Points."
++            print("[INFO] USE INT8 for KV CACHE")
++                
++        # self.cpu_cache = self.allocate_cpu_cache()
++
++        # Initialize the stream for caching operations.
++        self.cache_stream = torch.cuda.Stream()
++        
++        # Initialize the events for stream synchronization.
++        self.events: List[torch.cuda.Event] = []    
++
++        self.block_size = cache_config.block_size
++        
++        import zmq
++        model_name = model_config.model
++        num_layers = model_config.get_num_layers(parallel_config)
++        
++        rank = parallel_config.rank
++        tp_size = parallel_config.tensor_parallel_size
++        local_rank = rank % tp_size # local_rank bug fix
++        port = cache_config.kv_slab_ports[local_rank]
++        host = cache_config.kv_slab_host
++
++        context = zmq.Context()
++        socket = context.socket(zmq.REQ)
++        socket.connect(f"tcp://{host}:{port}")
++
++        sync_socket = context.socket(zmq.SUB)
++        sync_socket.connect(f"tcp://{host}:{port+1}")
++        sync_socket.setsockopt_string(zmq.SUBSCRIBE, "")
++
++        # socket.send_pyobj((os.getpid(), "handshake", None, ))
++        # engine_id = socket.recv_pyobj()
++        # print(f"[kvslab] Hand shake received, engine_id: {engine_id}")
++        tokens_per_block = 64 # TODO check if this is right.
++        
++        token_size = int(self.num_heads * self.head_size * self.dtype.itemsize / ( 2 if kv_cache_config["INT4_ENABLED"] else 1 ))
++        scale_size = tokens_per_block * self.num_heads * 2 * 2
++        block_byte_size = int(tokens_per_block * token_size + scale_size)
++
++        socket.send_pyobj((os.getpid(), "register", (model_name, num_layers, tokens_per_block, token_size, scale_size)))
++        engine_id = socket.recv_pyobj()
++        logger.info(f"[local rank {local_rank} engine_id {engine_id}] Register num_layers: {num_layers}, block_size: {block_byte_size/1024:.2f}")
++
++        start_signal = sync_socket.recv_string()
++        print(f"[local rank {local_rank} engine_id {engine_id}] Received {start_signal} from Resource Manager after KVSlabManager initializing.")
++        
++        setattr(cache_config,"engine_id", engine_id)
++        setattr(cache_config,"kv_slab_socket", socket)
++        setattr(cache_config,"kv_slab_sync_socket", sync_socket)
++        setattr(cache_config,"block_byte_size", block_byte_size)
++
++        socket.send_pyobj((engine_id, "get_slab_size", None))
++        SLAB_SIZE = socket.recv_pyobj()
++        logger.info(f"[local rank {local_rank} engine_id {engine_id}] slab_size: {SLAB_SIZE}")
++        socket.send_pyobj((engine_id, "get_engine_info", None))
++        engine_info = socket.recv_pyobj()
++        slab_pool_size = engine_info['slab_pool_size']
++        shared_kv_slab_offset = engine_info['shared_kv_slab_offset']
++
++        num_slabs = slab_pool_size // num_layers
++        logger.info(f"[local_rank {local_rank} engine_id {engine_id}] Num slabs: {num_slabs}")
++
++        # shared_kv mapping to kv tensors     
++        socket.send_pyobj((engine_id, "get_shared_kv", None))
++        shared_kv_info = socket.recv_pyobj()
++        shared_kv_info["storage_device"] = local_rank # kmbin: Need to remapping global gpu_id to local_rank
++        from torch.multiprocessing.reductions import rebuild_cuda_tensor
++        start_idx = shared_kv_slab_offset * 2 * SLAB_SIZE
++        end_idx = start_idx + slab_pool_size * 2 * SLAB_SIZE
++        logger.info(f"[local_rank {local_rank} engine_id {engine_id}] slab_range: {start_idx} : {end_idx}")
++        shared_kv =  rebuild_cuda_tensor(torch.Tensor, **shared_kv_info)
++        shared_kv = shared_kv[start_idx: end_idx]
++        shared_kv = shared_kv.view(num_layers, 2, num_slabs * SLAB_SIZE)
++        num_blocks = num_slabs * (SLAB_SIZE // block_byte_size)
++        self.num_gpu_blocks = num_blocks
++        self.num_cpu_blocks = num_blocks
++        cache_config.num_retrieval_gpu_blocks = self.num_gpu_blocks
++        logger.info(f"[local_rank {local_rank} engine_id {engine_id}] num_blocks: {self.num_gpu_blocks}")
++
++        logger.info(f"[kvslab] Register KVCache: {shared_kv.shape}, {shared_kv.device}")
++
++        self.ktensors = []
++        self.vtensors = []
++            
++        for i in range(self.num_layers):
++            self.events.append(torch.cuda.Event())
++                
++            self.ktensors.append(shared_kv[i][0].view(-1))
++            self.vtensors.append(shared_kv[i][1].view(-1))
++
++    def get_key_block_shape(self) -> Tuple[int, int, int]:
++        return (self.num_heads, self.block_size, self.head_size)
++
++    def get_value_block_shape(self) -> Tuple[int, int, int]:
++        return (self.num_heads, self.block_size, self.head_size)
++
++    # def allocate_gpu_cache(self) -> List[KVCache]:
++    #     gpu_cache: KVCache
++    #     key_block_shape = self.get_key_block_shape()
++    #     value_block_shape = self.get_value_block_shape()
++    #     # for _ in range(self.num_layers):
++    #     key_blocks = torch.empty(
++    #         size=(
++    #             self.num_gpu_blocks,
++    #             self.num_bytes_per_block + self.num_bytes_k_stats_per_block,
++    #         ),
++    #         dtype=self.dtype,
++    #         device="cuda",
++    #     )
++    #     value_blocks = torch.empty(
++    #         size=(self.num_gpu_blocks, self.num_bytes_per_block),
++    #         dtype=self.dtype,
++    #         device="cuda",
++    #     )
++    #     gpu_cache=(key_blocks, value_blocks)
++    #     return gpu_cache
++
++    def allocate_cpu_cache(self) -> List[KVCache]:
++        cpu_cache: KVCache
++        key_block_shape = self.get_key_block_shape()
++        value_block_shape = self.get_value_block_shape()
++        pin_memory = True
++        # for _ in range(self.num_layers):
++        key_blocks = torch.empty(
++            size=(self.num_cpu_blocks, *key_block_shape),
++            dtype=self.dtype,
++            pin_memory=pin_memory,
++            device="cpu",
++        )
++        value_blocks = torch.empty(
++            size=(self.num_cpu_blocks, *value_block_shape),
++            dtype=self.dtype,
++            pin_memory=pin_memory,
++            device="cpu",
++        )
++        cpu_cache=(key_blocks, value_blocks)
++        return cpu_cache
++    
++    ############################################################################
++    
++    def get_retrieval_k_gpu_cache_ptr(self, layer_idx: int) -> int:
++        return self.ktensors[layer_idx].data_ptr()
++    
++    def get_retrieval_v_gpu_cache_ptr(self, layer_idx: int) -> int:
++        return self.vtensors[layer_idx].data_ptr()
++    
++    def get_streaming_k_gpu_cache_ptr(self, layer_idx: int) -> int:
++        raise NotImplementedError("Streaming KV ptr is not supported")
++        return self.layer_cache_engines[layer_idx][1].gpu_cache[0].data_ptr()
++    
++    def get_streaming_v_gpu_cache_ptr(self, layer_idx: int) -> int:
++        raise NotImplementedError("Streaming KV ptr is not supported")
++        return self.layer_cache_engines[layer_idx][1].gpu_cache[1].data_ptr()
++
++    def get_retrieval_gpu_num_bytes_per_block_k(self, layer_idx: int) -> int:
++        return self.num_bytes_per_block  #+ self.num_bytes_k_stats_per_block L-serve not supported
++
++    def get_retrieval_gpu_num_bytes_per_block_v(self, layer_idx: int) -> int:
++        return self.num_bytes_per_block
++
++    def get_streaming_gpu_num_bytes_per_block_k(self, layer_idx: int) -> int:
++        raise NotImplementedError("Streaming KV is not supported")
++        return self.layer_cache_engines[layer_idx][1].num_bytes_per_block  #+ self.layer_cache_engines[layer_idx][1].num_bytes_k_stats_per_block      # the num_bytes_k_stats_per_block for streaming is actually 0 
++
++    def get_streaming_gpu_num_bytes_per_block_v(self, layer_idx: int) -> int:
++        raise NotImplementedError("Streaming KV is not supported")
++        return self.layer_cache_engines[layer_idx][1].num_bytes_per_block
+diff --git a/omniserve/worker/model_runner.py b/omniserve/worker/model_runner.py
+index c94c214..c6b4971 100644
+--- a/omniserve/worker/model_runner.py
++++ b/omniserve/worker/model_runner.py
+@@ -41,7 +41,7 @@ from omniserve.sampling_params import SamplingParams
+ from omniserve.sequence import SamplerOutput, SequenceGroupMetadata
+ from omniserve.utils.input_metadata import InputMetadata
+ from omniserve.utils.utils import STR_DTYPE_TO_TORCH_DTYPE
+-from omniserve.worker.cache_engine import CacheEngine
++from omniserve.worker.cache_engine import CacheEngine, ElasticCacheEngine
+ 
+ from omniserve.modeling.layers.ctx_attn.ctx_attn_init import init_ctx_sparse_attn, init_sparse_kv_cache
+ from omniserve.modeling.layers.ctx_attn.block_table_utils import pad_block_tables, get_layer_block_tables, _make_tensor_with_pad
+@@ -241,9 +241,19 @@ class ModelRunner:
+             # f"# GPU blocks: {num_gpu_blocks}, " f"# CPU blocks: {num_cpu_blocks}"
+             f"# Retrieval GPU blocks: {num_retrieval_gpu_blocks}, " f"# Streaming GPU blocks: {num_streaming_gpu_blocks}" #f"# Retrieval CPU blocks: {num_retrieval_cpu_blocks}, " f"# Streaming CPU blocks: {num_streaming_cpu_blocks}"
+         )
+-        self.cache_engine = CacheEngine(
+-            cache_config, model_config, parallel_config, kv_cache_config
+-        )
++        # self.cache_engine = CacheEngine(
++        #     cache_config, model_config, parallel_config, kv_cache_config
++        # )
++        
++        if cache_config.use_kv_slab:
++            self.cache_engine = ElasticCacheEngine(
++                cache_config, model_config, parallel_config, kv_cache_config
++            )
++        else:
++            self.cache_engine = CacheEngine(
++                cache_config, model_config, parallel_config, kv_cache_config
++            )
++        
+         # self.cache_events = self.cache_engine.events
+         # self.gpu_cache = self.cache_engine.gpu_cache
+         self.cache_config = cache_config
+diff --git a/patches/0001-Added-branch-of-outputprocessing-via-QSERVE_VIA_VLLM.patch b/patches/0001-Added-branch-of-outputprocessing-via-QSERVE_VIA_VLLM.patch
+new file mode 100644
+index 0000000..5ebdd8c
+--- /dev/null
++++ b/patches/0001-Added-branch-of-outputprocessing-via-QSERVE_VIA_VLLM.patch
+@@ -0,0 +1,97 @@
++From 015a47d052b2b3fecbe35d377de2f0c100509eb4 Mon Sep 17 00:00:00 2001
++From: "jm2.son" <jm2.son@samsung.com>
++Date: Wed, 23 Jul 2025 01:59:19 +0000
++Subject: [PATCH] Added branch of outputprocessing via QSERVE_VIA_VLLM
++
++---
++ omniserve/engine/llm_engine.py | 46 +++++++++++++++++++++++++++-------
++ 1 file changed, 37 insertions(+), 9 deletions(-)
++
++diff --git a/omniserve/engine/llm_engine.py b/omniserve/engine/llm_engine.py
++index 7937021..ddc5f93 100644
++--- a/omniserve/engine/llm_engine.py
+++++ b/omniserve/engine/llm_engine.py
++@@ -48,6 +48,8 @@ from omniserve.utils.utils import (
++ logger = init_logger(__name__)
++ _LOCAL_LOGGING_INTERVAL_SEC = 5
++ 
+++_QSERVE_VIA_VLLM = bool(int(os.getenv('QSERVE_VIA_VLLM', 0)))
+++
++ 
++ class LLMEngine:
++     """An LLM engine that receives requests and generates texts.
++@@ -323,6 +325,30 @@ class LLMEngine:
++             >>> ...
++         """
++ 
+++        if _QSERVE_VIA_VLLM:
+++            vllm_sp = sampling_params
+++            sampling_params = SamplingParams(
+++                n=vllm_sp.n,
+++                best_of=vllm_sp.best_of,
+++                presence_penalty=vllm_sp.presence_penalty,
+++                frequency_penalty=vllm_sp.frequency_penalty,
+++                repetition_penalty=vllm_sp.repetition_penalty,
+++                temperature=vllm_sp.temperature,
+++                top_p=vllm_sp.top_p,
+++                top_k=-1 if vllm_sp.top_k < 1 else vllm_sp.top_k,
+++                min_p=vllm_sp.min_p,
+++                stop=vllm_sp.stop,
+++                stop_token_ids=vllm_sp.stop_token_ids,
+++                include_stop_str_in_output=vllm_sp.include_stop_str_in_output,
+++                ignore_eos=vllm_sp.ignore_eos,
+++                max_tokens=vllm_sp.max_tokens,
+++                logprobs=vllm_sp.logprobs,
+++                prompt_logprobs=vllm_sp.prompt_logprobs,
+++                skip_special_tokens=vllm_sp.skip_special_tokens,
+++                spaces_between_special_tokens=vllm_sp.spaces_between_special_tokens,
+++                logits_processors=vllm_sp.logits_processors,
+++            )
+++
++         if arrival_time is None:
++             arrival_time = time.monotonic()
++ 
++@@ -333,7 +359,6 @@ class LLMEngine:
++                 prompt_token_ids=prompt_token_ids,
++             )
++             prompt_len = len(prompt_token_ids)
++-            print(f"prompt_len: {prompt_len}")
++         else:
++             # profiling mode
++             prompt_len = profiling_config.prompt_len
++@@ -558,7 +583,8 @@ class LLMEngine:
++                 # output = all_outputs[0]
++             else:
++                 output = []
++-            out = self._process_model_outputs(output, self.scheduler_outputs)
+++            if not _QSERVE_VIA_VLLM:
+++                output = self._process_model_outputs(output, self.scheduler_outputs)
++         else:
++             # TODO (shang): Without ifb mode, implement how to decode
++             # Execute the model.
++@@ -583,13 +609,15 @@ class LLMEngine:
++                 ifb_mode=self.ifb_mode,
++             )
++             output = all_outputs[0].cpu().numpy().tolist()
++-            if self.benchmarking_mode:
++-                out = self._process_model_outputs_benchmark(
++-                    output, self.scheduler_outputs
++-                )
++-            else:
++-                out = self._process_model_outputs(output, self.scheduler_outputs)
++-        return out
+++            if not _QSERVE_VIA_VLLM:
+++                if self.benchmarking_mode:
+++                    output = self._process_model_outputs_benchmark(
+++                        output, self.scheduler_outputs
+++                    )
+++                else:
+++                    output = self._process_model_outputs(output, self.scheduler_outputs)
+++        
+++        return output
++ 
++     def _check_stop(self, seq: Sequence, sampling_params: SamplingParams) -> None:
++         """Stop the finished sequences."""
++-- 
++2.34.1
++
+diff --git a/pyproject.toml b/pyproject.toml
+index 4362a27..42e24d7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -13,16 +13,16 @@ classifiers = [
+     "License :: OSI Approved :: Apache Software License",
+ ]
+ dependencies = [
+-    "accelerate", "sentencepiece", "tokenizers>=0.12.1",
+-    "torch==2.2.0", "torchvision", 
+-    "numpy==1.26.0",
+-    "transformers==4.37.2", "datasets",
+-    "lm_eval==0.3.0", "texttable",
+-    "toml", "attributedict",
+-    "xformers", "protobuf",
+-    "ninja", "seaborn", 
+-    "jieba", "fuzzywuzzy", "rouge",
+-    "gradio==3.35.2", "gradio_client==0.2.9",
++#    "accelerate", "sentencepiece", "tokenizers>=0.12.1",
++#    "torch==2.2.0", "torchvision", 
++#    "numpy==1.26.0",
++#    "transformers==4.37.2", "datasets",
++#    "lm_eval==0.3.0", "texttable",
++#    "toml", "attributedict",
++#    "xformers", "protobuf",
++#    "ninja", "seaborn", 
++#    "jieba", "fuzzywuzzy", "rouge",
++#    "gradio==3.35.2", "gradio_client==0.2.9",
+     "fastapi", "uvicorn",
+     "pydantic==1.10.14"
+ ]

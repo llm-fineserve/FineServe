@@ -1,0 +1,16 @@
+cluster:
+  nnodes: 2
+  ngpus_per_node: 1
+models:
+- name: llm-0
+  model: /home/jovyan/shared-dir/hpclab/hub/llama-3.1-8b
+  rate: 5
+  qformat: org
+  model_size_org: 8
+  slo: 2
+- name: llm-1
+  model: /home/jovyan/shared-dir/hpclab/hub/fp8/llama-3.1-8b
+  rate: 5
+  qformat: fp8_kv8
+  model_size_org: 8
+  slo: 3
