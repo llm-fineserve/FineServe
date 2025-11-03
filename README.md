@@ -12,10 +12,10 @@ rates, latency SLOs, and memory constraints and efficiency, and a local schedule
 
 ### Download Fineserve and required files
 Download the code and related files from this repo. The patch files will be under a directory called 'FineServe/patches'
-(*TODO: Replace OUR_REPO after code is made public)
+
 
 ```
-git clone https://github.com/OUR_REPO/FineServe.git
+git clone https://github.com/llm-fineserve/FineServe.git
 ```
 
 
