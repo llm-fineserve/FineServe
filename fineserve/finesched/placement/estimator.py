@@ -1,6 +1,5 @@
 import abc
-from typing import Optional, List
-
+from typing import Optional, List, Dict, Any, Tuple
 import numpy as np
 
 from fineserve.finesched.placement.constants import *
@@ -9,61 +8,102 @@ from fineserve.finesched.placement.profile import ProfileData
 from fineserve.finesched.placement.utils import linear_interp
 
 
-def estimate_kv_cache_size(total_memory, llms: List[LLM], portion=None):
-    # weight = sum([llm.model_size for llm in llms])
-    # activation = sum([llm.activation_size for llm in llms])
-    # kv_cache_size = total_memory * 0.98 - weight - activation
+def estimate_kv_cache_size(total_memory: float, llms: List[LLM], portion: Optional[np.ndarray] = None) -> float:
+    """Estimate available KV cache size after accounting for model and activation memory.
+
+    Args:
+        total_memory: Total available memory
+        llms: List of LLM models
+        portion: Portion of memory allocated to each model
+
+    Returns:
+        Available KV cache size in GB
+    """
     placement_memory = np.array([llm.placement_memory for llm in llms])
     if portion is None:
         portion = np.ones_like(placement_memory)
     kv_cache_size = total_memory - np.sum(placement_memory * portion)
-    return max(0, kv_cache_size)
+    return max(0.0, kv_cache_size)
 
 
 class Estimator(abc.ABC):
+    """Abstract base class for performance estimators."""
 
-    def __init__(self,
-                 cost_file: str,
-                 memory_per_gpu: int = MEMORY_PER_GPU):
+    def __init__(self, cost_file: str, memory_per_gpu: int = MEMORY_PER_GPU):
+        """Initialize the estimator with cost data.
+
+        Args:
+            cost_file: Path to the cost CSV file
+            memory_per_gpu: Memory per GPU in GB
+        """
         self.cost_file = cost_file
         self.memory_per_gpu = memory_per_gpu
         self.pf = ProfileData()
         self.pf.read_cost_file(self.cost_file)
 
-        self._raw_cost = {}
-        self.model_cost = {}
+        self._raw_cost: Dict[str, Any] = {}
+        self.model_cost: Dict[str, Any] = {}
         self._build_cost()
 
-    def _build_cost(self):
-        for r in self.pf.data.itertuples():
-            model = getattr(r, MODEL)
-            qformat = getattr(r, QFORMAT)
-            ngpu = getattr(r, TP_SIZE)
-            mps = getattr(r, MPS_PERCENTAGE)
-            batch_size = getattr(r, BATCH_SIZE)
-            input_len = getattr(r, INPUT_LEN)
-            output_len = getattr(r, OUTPUT_LEN)
-            ttft = getattr(r, TTFT)
-            decoding_latency = getattr(r, DECODE_TIME)
+    def _build_cost(self) -> None:
+        """Build cost dictionaries from profile data."""
+        for record in self.pf.data.itertuples():
+            model = getattr(record, MODEL)
+            qformat = getattr(record, QFORMAT)
+            tp_size = getattr(record, TP_SIZE)
+            mps = getattr(record, MPS_PERCENTAGE)
+            batch_size = getattr(record, BATCH_SIZE)
+            input_len = getattr(record, INPUT_LEN)
+            output_len = getattr(record, OUTPUT_LEN)
+            ttft = getattr(record, TTFT)
+            decoding_latency = getattr(record, DECODE_TIME)
 
-            cost = self._raw_cost \
-                .setdefault(model, {}) \
-                .setdefault(qformat, {}) \
-                .setdefault(ngpu, {}) \
-                .setdefault(mps, {}) \
-                .setdefault(batch_size, {})
+            # Simplified nested dictionary creation
+            cost_entry = self._get_or_create_nested_dict(
+                self._raw_cost, [model, qformat, tp_size, mps, batch_size]
+            )
 
-            cost.setdefault(input_len, {}) \
-                .setdefault("prefill", []) \
-                .append(ttft)
-            cost.setdefault(output_len, {}) \
-                .setdefault("decoding", []) \
-                .append(decoding_latency)
+            # Add prefill and decoding latencies
+            self._append_to_nested_list(cost_entry, input_len, "prefill", ttft)
+            self._append_to_nested_list(cost_entry, output_len, "decoding", decoding_latency)
 
+        # Process raw costs into averaged model costs
         for model in self._raw_cost.keys():
             self.add_model_cost(model, self._raw_cost[model])
 
-    def add_model_cost(self, model: str, model_cost: dict):
+    def _get_or_create_nested_dict(self, container: dict, keys: List[Any]) -> dict:
+        """Get or create a nested dictionary structure.
+
+        Args:
+            container: Dictionary to operate on
+            keys: List of keys for nesting
+
+        Returns:
+            Nested dictionary at the specified path
+        """
+        current = container
+        for key in keys:
+            current = current.setdefault(key, {})
+        return current
+
+    def _append_to_nested_list(self, container: dict, key: Any, subkey: str, value: float) -> None:
+        """Append a value to a nested list structure.
+
+        Args:
+            container: Dictionary to operate on
+            key: Primary key
+            subkey: Secondary key
+            value: Value to append
+        """
+        container.setdefault(key, {}).setdefault(subkey, []).append(value)
+
+    def add_model_cost(self, model: str, model_cost: dict) -> None:
+        """Process raw cost data into averaged model costs.
+
+        Args:
+            model: Model name
+            model_cost: Raw cost data
+        """
         self.model_cost[model] = {}
         for qformat, qformat_cost in model_cost.items():
             self.model_cost[model][qformat] = {}
@@ -82,217 +122,337 @@ class Estimator(abc.ABC):
                             }
 
     @abc.abstractmethod
-    def estimate_mps(self,
-                     llm: LLM,
-                     tp: int,
-                     prefill_mps: int) -> ThroughputConfig:
-        ...
+    def estimate_mps(self, llm: LLM, tp_size: int, prefill_mps: int) -> ThroughputConfig:
+        """Estimate optimal MPS settings.
+
+        Args:
+            llm: Language model
+            tp_size: Tensor parallelism size
+            prefill_mps: Prefill MPS percentage
+
+        Returns:
+            Throughput configuration
+        """
+        pass
 
     @abc.abstractmethod
-    def estimate_throughputs(self,
-                            llm: LLM,
-                            tp_size: int,
-                            prefill_mps: int,
-                            decoding_mps: int,
-                            cache_size: Optional[float] = None) -> ThroughputConfig:
-        ...
+    def estimate_throughputs(self, llm: LLM, tp_size: int, prefill_mps: int,
+                             decoding_mps: int, cache_size: Optional[float] = None) -> ThroughputConfig:
+        """Estimate throughputs for given configuration.
+
+        Args:
+            llm: Language model
+            tp_size: Tensor parallelism size
+            prefill_mps: Prefill MPS percentage
+            decoding_mps: Decoding MPS percentage
+            cache_size: Available cache size
+
+        Returns:
+            Throughput configuration
+        """
+        pass
 
 
 class FineServeEstimator(Estimator):
+    """FineServe-specific performance estimator."""
 
-    def __init__(self,
-                 cost_file: str,
-                 memory_per_gpu: int = MEMORY_PER_GPU):
+    def __init__(self, cost_file: str, memory_per_gpu: int = MEMORY_PER_GPU,
+                 max_batch_size: int = 32):
+        """Initialize the FineServe estimator.
+
+        Args:
+            cost_file: Path to the cost CSV file
+            memory_per_gpu: Memory per GPU in GB
+            max_batch_size: Maximum batch size to consider
+        """
         super().__init__(cost_file, memory_per_gpu)
-        self.MAX_BATCH_SIZE = 32 # TODO: make this parameter configurable with yaml file
+        self.max_batch_size = max_batch_size
 
-    def get_avg_latency_per_token(self, llm: LLM, tp_size, mps, batch_size, prefill=True):
+    def get_avg_latency_per_token(self, llm: LLM, tp_size: int, mps: int,
+                                  batch_size: int, prefill: bool = True) -> Optional[float]:
+        """Calculate average latency per token.
+
+        Args:
+            llm: Language model
+            tp_size: Tensor parallelism size
+            mps: MPS percentage
+            batch_size: Batch size
+            prefill: Whether to calculate prefill latency
+
+        Returns:
+            Average latency per token or None if not available
+        """
         key = "prefill" if prefill else "decoding"
+
         try:
             bs_cost = self.model_cost[llm.model_type][llm.qformat][tp_size][mps][batch_size]
-        except KeyError as e:
+        except KeyError:
             return None
-        latency_per_token = [cost_info.get(key) / seq_len
-                             for seq_len, cost_info in bs_cost.items()
-                             if cost_info.get(key) is not None]
+
+        latency_per_token = [
+            cost_info.get(key) / seq_len
+            for seq_len, cost_info in bs_cost.items()
+            if cost_info.get(key) is not None
+        ]
+
         if not latency_per_token:
             return None
+
         return np.mean(latency_per_token)
 
-    def get_avg_latency(self, llm: LLM, tp_size, mps, batch_size, seq_len, prefill=True):
-        latency_per_token = self.get_avg_latency_per_token(llm, tp_size, mps, batch_size,
-                                                           prefill=prefill)
+    def get_avg_latency(self, llm: LLM, tp_size: int, mps: int, batch_size: int,
+                        seq_len: float, prefill: bool = True) -> Optional[float]:
+        """Calculate average latency for a sequence.
+
+        Args:
+            llm: Language model
+            tp_size: Tensor parallelism size
+            mps: MPS percentage
+            batch_size: Batch size
+            seq_len: Sequence length
+            prefill: Whether to calculate prefill latency
+
+        Returns:
+            Average latency or None if not available
+        """
+        latency_per_token = self.get_avg_latency_per_token(
+            llm, tp_size, mps, batch_size, prefill=prefill
+        )
+
         if not latency_per_token:
             return None
-        avg_latency = np.mean(latency_per_token) * seq_len
-        return avg_latency
 
-    def get_batch_and_avg_cost(self,
-                               llm: LLM,
-                               tp_size: int,
-                               prefill_mps: int,
-                               decoding_mps: int,
-                               input_len: float,
-                               output_len: float):
-        ttft_bs_data = []
-        ttft_data = []
-        dec_lat_bs_data = []
-        dec_lat_data = []
-        tpt_bs_data = []
-        tpt_data = []
+        return latency_per_token * seq_len
+
+    def get_batch_and_avg_cost(self, llm: LLM, tp_size: int, prefill_mps: int,
+                               decoding_mps: int, input_len: float, output_len: float) -> CostData:
+        """Calculate batch sizes and associated costs.
+
+        Args:
+            llm: Language model
+            tp_size: Tensor parallelism size
+            prefill_mps: Prefill MPS percentage
+            decoding_mps: Decoding MPS percentage
+            input_len: Input sequence length
+            output_len: Output sequence length
+
+        Returns:
+            Cost data structure
+        """
+        ttft_batch_sizes, ttft_latencies = [], []
+        decoding_batch_sizes, decoding_latencies = [], []
+        throughput_batch_sizes, throughputs = [], []
+
         for batch_size in self.pf.all_categories[BATCH_SIZE]:
-            pre_lat = self.get_avg_latency(llm,
-                                           tp_size,
-                                           prefill_mps,
-                                           batch_size,
-                                           input_len,
-                                           True)
-            if pre_lat:
-                ttft_bs_data.append(batch_size)
-                ttft_data.append(pre_lat)
+            # Calculate prefill latency
+            prefill_latency = self.get_avg_latency(
+                llm, tp_size, prefill_mps, batch_size, input_len, True
+            )
 
-            dec_lat = self.get_avg_latency(llm,
-                                           tp_size,
-                                           decoding_mps,
-                                           batch_size,
-                                           output_len,
-                                           False)
-            if dec_lat:
-                dec_lat_bs_data.append(batch_size)
-                dec_lat_data.append(dec_lat)
+            if prefill_latency:
+                ttft_batch_sizes.append(batch_size)
+                ttft_latencies.append(prefill_latency)
 
-            if pre_lat and dec_lat:
-                tpt = batch_size / (pre_lat + dec_lat)
-                tpt_bs_data.append(batch_size)
-                tpt_data.append(tpt)
+            # Calculate decoding latency
+            decoding_latency = self.get_avg_latency(
+                llm, tp_size, decoding_mps, batch_size, output_len, False
+            )
 
-        data = CostData(llm.name, tp_size,
-                        prefill_mps, decoding_mps,
-                        input_len,
-                        output_len,
-                        ttft_data, ttft_bs_data,
-                        dec_lat_data, dec_lat_bs_data,
-                        tpt_data, tpt_bs_data)
-        return data
+            if decoding_latency:
+                decoding_batch_sizes.append(batch_size)
+                decoding_latencies.append(decoding_latency)
 
+            # Calculate throughput if both latencies are available
+            if prefill_latency and decoding_latency:
+                throughput = batch_size / (prefill_latency + decoding_latency)
+                throughput_batch_sizes.append(batch_size)
+                throughputs.append(throughput)
 
-    def set_tp_candidates(self,
-                          llm: LLM,
-                          prefill_mps: int = 100,
-                          verbose: bool = False):
+        return CostData(
+            llm.name, tp_size,
+            prefill_mps, decoding_mps,
+            input_len, output_len,
+            ttft_latencies, ttft_batch_sizes,
+            decoding_latencies, decoding_batch_sizes,
+            throughputs, throughput_batch_sizes
+        )
+
+    def set_tp_candidates(self, llm: LLM, prefill_mps: int = 100, verbose: bool = False) -> None:
+        """Set tensor parallelism candidates for the LLM.
+
+        Args:
+            llm: Language model
+            prefill_mps: Prefill MPS percentage
+            verbose: Whether to print verbose output
+        """
         llm.tp_candidates = {}
-        for tp_size in [1, 2, 4, 8]:
-            tpt_config = self.estimate_tp_trpt_config(llm, tp_size)
-            ## if impossible to satisfy, then skip this tp
-            if tpt_config is None:
-                #print(f"Impossible to setup model {llm.name} for TP{ngpu}")
-                continue
-            llm.tp_candidates[tp_size] = tpt_config
 
-        llm.min_mesh_size = 8
-        if llm.tp_candidates:
-            llm.min_mesh_size = min([ngpu for ngpu in llm.tp_candidates])
+        for tp_size in [1, 2, 4, 8]:
+            throughput_config = self._estimate_tp_throughput_config(llm, tp_size)
+
+            # Skip impossible configurations
+            if throughput_config is None:
+                continue
+
+            llm.tp_candidates[tp_size] = throughput_config
+
+        # Set minimum mesh size
+        llm.min_mesh_size = min(llm.tp_candidates.keys()) if llm.tp_candidates else 8
         assert len(llm.tp_candidates) > 0, "No valid mesh size"
 
         if verbose:
-            print(f"## LLM: {llm.name}, Model: {llm.model}, "
-                  f"Rate: {llm.rate}, Candidates:")
-            for _, c in llm.tp_candidates.items():
-                ngpu = c.tp_size
-                mps = c.mps_percentage
-                bs = c.batch_size
-                tpt = c.throughput
-                sfy = c.satisfied
-                print(f"### ngpu: {ngpu}, mps: {mps}, bs: {bs}, "
-                      f"tpt: {tpt:.3f}, can_satisfy: {sfy}")
+            self._print_tp_candidates(llm)
 
-    def estimate_tp_trpt_config(self,
-                                llm: LLM,
-                                tp_size: int):
+    def _estimate_tp_throughput_config(self, llm: LLM, tp_size: int) -> Optional[ThroughputConfig]:
+        """Estimate throughput configuration for a TP size.
 
+        Args:
+            llm: Language model
+            tp_size: Tensor parallelism size
+
+        Returns:
+            Throughput configuration or None if not possible
+        """
         if tp_size not in self.pf.all_categories[TP_SIZE]:
             return None
 
-        tpt_config = self.estimate_throughputs(llm,
-                                              tp_size,
-                                              prefill_mps=100,
-                                              decoding_mps=100)
+        throughput_config = self.estimate_throughputs(
+            llm, tp_size, prefill_mps=100, decoding_mps=100
+        )
 
-        if tpt_config is None:
-            return None
+        return throughput_config
 
-        return tpt_config
+    def _print_tp_candidates(self, llm: LLM) -> None:
+        """Print TP candidates for debugging.
 
-    def estimate_mps(self,
-                     llm: LLM,
-                     tp_size: int,
-                     prefill_mps: int) -> ThroughputConfig:
-        max_tpt_config = ThroughputConfig(False, tp_size, 1, 0, 0, 0, 0, 0, 0, None)
+        Args:
+            llm: Language model
+        """
+        print(f"## LLM: {llm.name}, Model: {llm.model}, Rate: {llm.rate}, Candidates:")
+        for _, config in llm.tp_candidates.items():
+            print(f"### ngpu: {config.tp_size}, mps: {config.mps_percentage}, "
+                  f"bs: {config.rate_min_batch_size}, tpt: {config.throughput:.3f}, "
+                  f"can_satisfy: {config.satisfied}")
+
+    def estimate_mps(self, llm: LLM, tp_size: int, prefill_mps: int) -> ThroughputConfig:
+        """Estimate optimal MPS settings.
+
+        Args:
+            llm: Language model
+            tp_size: Tensor parallelism size
+            prefill_mps: Prefill MPS percentage
+
+        Returns:
+            Throughput configuration
+        """
+        max_throughput_config = ThroughputConfig(
+            False, tp_size, 1, 0, 0, 0, 0, 0, 0, None
+        )
+
         if tp_size not in self.pf.all_categories[TP_SIZE]:
-            return max_tpt_config
+            return max_throughput_config
 
         for decoding_mps in self.pf.all_categories[MPS_PERCENTAGE]:
-            tpt_config = self.estimate_throughputs(llm,
-                                                  tp_size,
-                                                  prefill_mps,
-                                                  decoding_mps)
-            if tpt_config.satisfied:
-                return tpt_config
+            throughput_config = self.estimate_throughputs(
+                llm, tp_size, prefill_mps, decoding_mps
+            )
 
-            if tpt_config.throughput > max_tpt_config.throughput:
-                max_tpt_config = tpt_config
+            if throughput_config.satisfied:
+                return throughput_config
 
-        return max_tpt_config
+            if throughput_config.throughput > max_throughput_config.throughput:
+                max_throughput_config = throughput_config
 
-    def estimate_throughputs(self,
-                            llm: LLM,
-                            tp_size: int,
-                            prefill_mps: int,
-                            decoding_mps: int,
-                            cache_size: Optional[float] = None) -> ThroughputConfig:
-        data = self.get_batch_and_avg_cost(llm,
-                                           tp_size,
-                                           prefill_mps,
-                                           decoding_mps,
-                                           llm.avg_input_len,
-                                           llm.avg_output_len)
-        ## data related to tp does not exist
-        if not data.ttft or not data.throughput:
+        return max_throughput_config
+
+    def estimate_throughputs(self, llm: LLM, tp_size: int, prefill_mps: int,
+                             decoding_mps: int, cache_size: Optional[float] = None) -> Optional[ThroughputConfig]:
+        """Estimate throughputs for given configuration.
+
+        Args:
+            llm: Language model
+            tp_size: Tensor parallelism size
+            prefill_mps: Prefill MPS percentage
+            decoding_mps: Decoding MPS percentage
+            cache_size: Available cache size
+
+        Returns:
+            Throughput configuration or None if not possible
+        """
+        cost_data = self.get_batch_and_avg_cost(
+            llm, tp_size, prefill_mps, decoding_mps,
+            llm.avg_input_len, llm.avg_output_len
+        )
+
+        # Return None if no data is available
+        if not cost_data.ttft or not cost_data.throughput:
             return None
-        dp_size=1
-        the_rate=llm.rate
-        good_to_go=False
-        can_satisfy=False
-        while not good_to_go:
-            # maximum batch size which satisfies the SLO
-            slo_bs = np.floor(linear_interp(llm.slo, data.ttft, data.ttft_batch_size))
-            # minumum batch size which satisfies the request rate
-            rate_bs = np.ceil(linear_interp(the_rate, data.throughput, data.throughput_batch_size))
+
+        # Initialize variables for iterative optimization
+        data_parallel_size = 1
+        request_rate = llm.rate
+        satisfiable = False
+
+        while not satisfiable:
+            # Calculate maximum batch size that satisfies SLO
+            slo_max_batch_size = np.floor(
+                linear_interp(llm.slo, cost_data.ttft, cost_data.ttft_batch_size)
+            )
+
+            # Calculate minimum batch size that satisfies request rate
+            rate_min_batch_size = np.ceil(
+                linear_interp(request_rate, cost_data.throughput, cost_data.throughput_batch_size)
+            )
+
+            # Calculate available cache size
             if cache_size is None:
-                cache_size = estimate_kv_cache_size(self.memory_per_gpu * tp_size, [llm])
-            cache_bs = np.floor_divide(cache_size, llm.kv_cache_size_per_seq()) # cache_bs : max batch size related kv cache
-            max_bs = min(cache_bs, slo_bs)
+                cache_size = estimate_kv_cache_size(
+                    self.memory_per_gpu * tp_size, [llm]
+                )
 
-            can_satisfy = (rate_bs <= max_bs)
-            cur_bs = min(rate_bs, max_bs)
+            # Calculate maximum batch size constrained by cache
+            cache_max_batch_size = np.floor_divide(
+                cache_size, llm.kv_cache_size_per_seq()
+            )
 
-            # cases where rate is very small, but can be satisfied
-            if can_satisfy and rate_bs <= 0.0:
-                cur_bs=1
-                rate_bs=1
+            # Determine actual maximum batch size
+            max_batch_size = min(cache_max_batch_size, slo_max_batch_size)
 
-            ttft = linear_interp(cur_bs, data.ttft_batch_size, data.ttft)
-            dec_lat = linear_interp(cur_bs, data.decoding_latency_batch_size, data.decoding_latency)
-            tpt_cal = cur_bs / (ttft + dec_lat)
+            # Check if we can satisfy the request rate
+            satisfiable = (rate_min_batch_size <= max_batch_size)
+            current_batch_size = min(rate_min_batch_size, max_batch_size)
 
-            if can_satisfy:
-                good_to_go=True
-            else:
-                dp_size = dp_size +1
-                the_rate = llm.rate // dp_size
-            # check whether this is end of the line (this tp setting has no way to satisfy the rate)
-            if the_rate <= 0.0:
+            # Special case for very low rates
+            if satisfiable and rate_min_batch_size <= 0.0:
+                current_batch_size = 1
+                rate_min_batch_size = 1
+
+            # Calculate latencies for current batch size
+            ttft = linear_interp(
+                current_batch_size, cost_data.ttft_batch_size, cost_data.ttft
+            )
+            decoding_latency = linear_interp(
+                current_batch_size, cost_data.decoding_latency_batch_size,
+                cost_data.decoding_latency
+            )
+
+            # Calculate throughput
+            throughput = current_batch_size / (ttft + decoding_latency)
+
+            # If satisfiable, we're done
+            if satisfiable:
                 break
 
-        return ThroughputConfig(can_satisfy, tp_size, dp_size, decoding_mps, int(rate_bs), slo_bs,
-                                tpt_cal, ttft, dec_lat, data)
+            # Otherwise, increase data parallelism and reduce effective rate
+            data_parallel_size += 1
+            request_rate = llm.rate // data_parallel_size
+
+            # Check if we've exhausted possibilities
+            if request_rate <= 0.0:
+                break
+
+        return ThroughputConfig(
+            satisfiable, tp_size, data_parallel_size, decoding_mps,
+            int(rate_min_batch_size), slo_max_batch_size,
+            throughput, ttft, decoding_latency, cost_data
+        )

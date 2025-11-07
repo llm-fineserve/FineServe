@@ -13,13 +13,9 @@ from vllm import EngineArgs, LLMEngine, RequestOutput, CompletionOutput
 from vllm.utils import FlexibleArgumentParser
 from vllm.inputs import TokensPrompt
 from typing import List
-from fineserve.utils.constant import (SM_HOLD_NAME_FMT, OUT_HOLD_NAME_FMT, ADD_REQ_NAME_FMT,
-                                RET_REQ_NAME_FMT, PREEMPT_REQ_NAME_FMT)
 from fineserve.utils.workload_utils import Request
-from fineserve.utils.shm_utils import (create_shared_var, read_shared_var,
-                                write_shared_var, dump_to_shared_var,
-                                load_from_shared_var, load_reqs_from_shared_var,
-                                dump_reqs_to_shared_var, write_list_to_shared_var)
+from fineserve.utils.shm_manager import SharedMemoryManager
+from fineserve.fineserver.config import ServerConfig
 from fineserve.logger import get_logger
 
 logger = get_logger()
@@ -50,31 +46,29 @@ def add_test_prompt(model_name,
                     mps_percentage):
     cur_prompt_len = 16
     max_token = 16
-    random_prompt = np.random.randint(0, 24000, size=cur_prompt_len).tolist()
+    random_prompt = np.random.randint(0, ServerConfig.PROMPT_VOCAB_SIZE, size=cur_prompt_len).tolist()
     data_item = (random_prompt, cur_prompt_len, max_token)
     requests: List[Request] = []
     req = Request(model_name=model_name, slo=1,
                   idx=0, time_stamp={}, data=data_item)
     requests.append(req)
-    shm_name = ADD_REQ_NAME_FMT.format(
-        model_name, mps_percentage)
+    shm_name = SharedMemoryManager.get_shared_memory_name(model_name, mps_percentage,'add_req')
     num_iters = 1
 
     for req in requests:
         if req.submit_time is None:
             req.submit_time = time.time()
 
-    dump_reqs_to_shared_var(shm_name, requests)
-    name = SM_HOLD_NAME_FMT.format(model_name, mps_percentage)
-    shm_var = create_shared_var(name, create=False)
-    write_shared_var(shm_var, num_iters)
+
+    SharedMemoryManager.dump_reqs_to_shared_var(shm_name,requests)
+    name = SharedMemoryManager.get_shared_memory_name(model_name,mps_percentage,'sm_hold')
+    shm_var = SharedMemoryManager.create_shared_var(name,create=False)
+    SharedMemoryManager.write_shared_var(shm_var,num_iters)
 
 ## for standalone unit testing
 def create_shared_vars_standalone(model_name, mps_percentage):
-    name = SM_HOLD_NAME_FMT.format(model_name, mps_percentage)
-    shm_var = create_shared_var(name,
-                                size=6,
-                                create=True)
+    name = SharedMemoryManager.get_shared_memory_name(model_name,mps_percentage,'sm_hold')
+    shm_var = SharedMemoryManager.create_shared_var(name,size=6,create=True)
     return shm_var
 
 
@@ -91,36 +85,26 @@ class FineServeEngine:
 
         self.llm_runtime = llm_runtime
         self.engine_args = engine_args
-
+        #
         self.mps_percentage = mps_percentage
         self.model_name = model_name
         self.model_id = model_id
         self.rank = rank
-
         self.lock = asyncio.Lock()
-        sm_hold_shm_name = SM_HOLD_NAME_FMT.format(self.model_name, self.mps_percentage)
-        output_hold_shm_name = OUT_HOLD_NAME_FMT.format(self.model_name, self.mps_percentage)
-        self.sm_hold_shm = create_shared_var(sm_hold_shm_name,
-                                             create=False)
-        self.out_hold_shm = create_shared_var(output_hold_shm_name,
-                                              create=False)
-        self.add_req_shm_name = ADD_REQ_NAME_FMT.format(
-            self.model_name, self.mps_percentage)
-        self.ret_req_shm_name = RET_REQ_NAME_FMT.format(
-            self.model_name, self.mps_percentage)
-        self.preempt_req_shm_name = PREEMPT_REQ_NAME_FMT.format(
-            self.model_name, self.mps_percentage)
-
+        #
+        sm_hold_shm_name = SharedMemoryManager.get_shared_memory_name(self.model_name,self.mps_percentage,'sm_hold')
+        output_hold_shm_name = SharedMemoryManager.get_shared_memory_name(self.model_name,self.mps_percentage,'out_hold')
+        self.add_req_shm_name = SharedMemoryManager.get_shared_memory_name(self.model_name, self.mps_percentage,'add_req')
+        self.ret_req_shm_name = SharedMemoryManager.get_shared_memory_name(self.model_name, self.mps_percentage,'ret_req')
+        self.sm_hold_shm = SharedMemoryManager.create_shared_var(sm_hold_shm_name, create=False)
+        self.out_hold_shm = SharedMemoryManager.create_shared_var(output_hold_shm_name, create=False)
+        #
         self.requests_running: Set[int] = set()
         self.requests_enqueued: Set[int] = set()
         self.requests_max_tokens: Dict[int, int] = {}
-
         self.requests: Dict[int, Request] = {}
-
+        #
         self.enable_profiler = False
-        self.start_batch = 100
-        self.stop_batch = 150
-        self.cur_batch = 0
         self.prof = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -128,19 +112,20 @@ class FineServeEngine:
             ],
             with_stack=True,
             with_modules=True) if self.enable_profiler else None
+
         model = self.model_name.split("/")[-1]
         self.sched_dict = {}
         self.prof_out_name = f"log/profiler_fineserve/profiler_{model}_mps{self.mps_percentage}_id{self.model_id}.json"
         self.ttft_compt_per_token = []
         self.ttft_compt_per_token_step = []
         self.step = 0
-
         self.TIMEOUT_SECS=timout_s
         self.aborted_reqs = []
+        self.completed_requests = []
 
     def add_requests(self):
         while True:
-            batch_reqs = load_reqs_from_shared_var(self.add_req_shm_name)
+            batch_reqs = SharedMemoryManager.load_reqs_from_shared_var(self.add_req_shm_name)
             if batch_reqs:
                 break
         num_requests = len(batch_reqs)
@@ -176,8 +161,10 @@ class FineServeEngine:
         return batch_request_ids, batch_output_tokens
 
     def warmup_engine(self):
-        warmup_prompts=10
-        WARMUP_PARAMS=SamplingParams(temperature=0.8, top_p=0.95, max_tokens=20)
+        warmup_prompts=ServerConfig.DEFAULT_WARMUP_PROMPTS
+        WARMUP_PARAMS=SamplingParams(temperature=ServerConfig.DEFAULT_SAMPLING_TEMP,
+                                     top_p=ServerConfig.DEFAULT_SAMPLING_TOP_P,
+                                     max_tokens=ServerConfig.DEFAULT_WARMUP_MAX_TOKENS)
         request_id = 0
         logger.info(f"Started warmup with {warmup_prompts} prompts")
         while warmup_prompts or self.llm_runtime.has_unfinished_requests():
@@ -190,6 +177,7 @@ class FineServeEngine:
                 request_id += 1
 
             request_outputs: list[RequestOutput] = self.llm_runtime.step()
+            ## this might seem weight wierd but it's the way to do it according to vLLM docs
             for output in request_outputs:
                 pass
         logger.info(f"Ended warmup ")
@@ -252,11 +240,11 @@ class FineServeEngine:
             for _id in finished_req_id_dict:
                 logger.info(f"step[{step}] | tokens of id: {_id}")
                 logger.info(f"step[{step}] | {finished_req_id_dict[_id]}")
-        output_signal = read_shared_var(self.out_hold_shm)
+        output_signal = SharedMemoryManager.read_shared_var(self.out_hold_shm)
         ## wait until server has processed previous output
         while output_signal==1:
             time.sleep(0.001)
-            output_signal = read_shared_var(self.out_hold_shm)
+            output_signal = SharedMemoryManager.read_shared_var(self.out_hold_shm)
         output_data_list=[]
         output_data_list.append(num_of_finished_prefill)
         for _id in  finished_prefill_req_id_list:
@@ -268,47 +256,108 @@ class FineServeEngine:
             output_data_list = output_data_list + list(finished_req_id_dict[_id])
         while True:
             try:
-                write_list_to_shared_var(self.ret_req_shm_name, output_data_list)
+                SharedMemoryManager.write_list_to_shared_var(self.ret_req_shm_name,output_data_list)
                 break
             except FileExistsError:
                 time.sleep(1 / 5e4)
         output_signal = 1
-        write_shared_var(self.out_hold_shm, output_signal)
+        SharedMemoryManager.write_shared_var(self.out_hold_shm, output_signal)
+
+
+    def _wait_for_signal(self, expected_value, sleep_interval_s=ServerConfig.DEFAULT_SLEEP_INTERVAL):
+        read_signal=0
+        while not read_signal:
+            read_signal = SharedMemoryManager.read_shared_var(self.sm_hold_shm)
+            if read_signal == expected_value:
+                break
+            time.sleep(sleep_interval_s)
+
+    def _reset_sm_hold_shm_val(self, val: int):
+        SharedMemoryManager.write_shared_var(self.sm_hold_shm, val)
+
+    def handle_timeout_requests(self):
+        # logger.info(f"requests_enqueued : {self.requests_enqueued}")
+        # logger.info(f"requests_running: {self.requests_running}")
+        ids_to_check = set()
+        ids_to_check.update(self.requests_enqueued)
+        ids_to_check.update(self.requests_running)
+        for req_id in ids_to_check:
+            if time.time() - self.sched_dict[req_id]["start"] > self.TIMEOUT_SECS:
+                if req_id not in self.aborted_reqs:
+                    self.aborted_reqs.append(req_id)
+                    # logger.info(f"ABORTED {req_id} after {self.TIMEOUT_SECS} timeout seconds")
+                    self.llm_runtime.abort_request([str(req_id)])
+
+
+        ## process aborted requests due to timeout
+        request_outputs=[]
+        for req_id in self.aborted_reqs:
+            logger.info(f"step[{self.step}] | ABORTED req[{req_id}] after timeout {self.TIMEOUT_SECS} s")
+            req = self.requests[req_id]
+            comp_output = CompletionOutput(index=req_id,
+                                           text=None,
+                                           token_ids=[-1],
+                                           cumulative_logprob=None,
+                                           logprobs=None)
+            output = RequestOutput(request_id=str(req_id),
+                                   prompt=None,
+                                   prompt_token_ids=req.data[0],
+                                   prompt_logprobs=None,
+                                   outputs=[comp_output],
+                                   finished=True)
+            request_outputs.append(output)
+            self.aborted_reqs.remove(req_id)
+        return request_outputs
+
+
+    def _check_and_update_stats(self, list_of_outputs, now):
+        finished_requests = {} # key: request id , val: output tokens
+        finished_prefill_requests:List[int] = [] # list if request ids
+        for output in list_of_outputs:
+            req_id = int(output.request_id)
+            if self.sched_dict[req_id]["prefill_end"] is None:
+                if DEBUG is not None:
+                    logger.info(f"step[{self.step}] | req[{req_id}] | prefill end: {now}")
+                self.sched_dict[req_id]["prefill_end"] = now
+                if not output.finished:
+                    self.sched_dict[req_id]["stats"] = \
+                        self.llm_runtime.output_processor.request_states[str(req_id)].stats
+                finished_prefill_requests.append(req_id)
+            if output.finished:
+                self.sched_dict[req_id]["decode_end"] = now
+                req = self.requests[req_id]
+                finished_requests[req.idx] = output.outputs[0].token_ids
+                self.sched_dict[req.idx]["num_output_token"] = len(output.outputs[0].token_ids)
+        return finished_requests, finished_prefill_requests
+
+    def _async_output_process(self,finished_requests,finished_prefill_requests):
+        # check for previous output  processing task
+        finished_requests_ids = list(finished_requests.keys())
+        self.requests_enqueued.difference_update(finished_prefill_requests)
+        self.requests_running.update(finished_prefill_requests)
+        self.requests_running.difference_update(finished_requests_ids)
+        self.completed_requests = self.completed_requests + finished_requests_ids
+        async_output_task = asyncio.create_task(
+            self.process_outputs(finished_requests, finished_prefill_requests))
+        return async_output_task
 
     async def exec_batch_loop(self):
         ## do warmup (sync)
         self.warmup_engine()
         ## signal the scheduler that warmup is finished
-        warmup_done = 2
-        write_shared_var(self.sm_hold_shm, warmup_done)
+        self._reset_sm_hold_shm_val(val=2) # warmup_donw:2
 
         read_signal = 0
         output_task = None
         while True:
-            ## check signal
-            completed_requests = []
-            while not read_signal:
-                read_signal = read_shared_var(self.sm_hold_shm)
-                if read_signal == 1:
-                    break
-                time.sleep(0.001)
+            ## check and wait for signal
+            self._wait_for_signal(expected_value=1)
             self.add_requests()
-            read_signal=0
-            write_shared_var(self.sm_hold_shm, read_signal)
+            self._reset_sm_hold_shm_val(val=0) # reset to 0
+
             while self.llm_runtime.has_unfinished_requests() or self.aborted_reqs:
                 ## check timeout and abort
-                # logger.info(f"requests_enqueued : {self.requests_enqueued}")
-                # logger.info(f"requests_running: {self.requests_running}")
-                ids_to_check = set()
-                ids_to_check.update(self.requests_enqueued)
-                ids_to_check.update(self.requests_running)
-                for req_id in ids_to_check:
-                    if time.time() - self.sched_dict[req_id]["start"] > self.TIMEOUT_SECS:
-                        if req_id not in self.aborted_reqs:
-                            self.aborted_reqs.append(req_id)    # 여기서 한번만
-                            # logger.info(f"ABORTED {req_id} after {self.TIMEOUT_SECS} timeout seconds")
-                            self.llm_runtime.abort_request([str(req_id)])
-
+                aborted_request_outputs = self.handle_timeout_requests()
 
                 finished_requests = {} # key: request id , val: output tokens
                 finished_prefill_requests:List[int] = [] # list if request ids
@@ -321,67 +370,27 @@ class FineServeEngine:
                     request_outputs = self.llm_runtime.step()
                 now = time.time()
                 elapsed = now - prev
-
-                ## process aborted requests due to timeout
-                for req_id in self.aborted_reqs:
-                    logger.info(f"step[{self.step}] | ABORTED req[{req_id}] after timeout {self.TIMEOUT_SECS} s")
-                    req = self.requests[req_id]
-                    comp_output = CompletionOutput(index=req_id,
-                                                   text=None,
-                                                   token_ids=[-1],
-                                                   cumulative_logprob=None,
-                                                   logprobs=None)
-                    output = RequestOutput(request_id=str(req_id),
-                                           prompt=None,
-                                           prompt_token_ids=req.data[0],
-                                           prompt_logprobs=None,
-                                           outputs=[comp_output],
-                                           finished=True)
-                    request_outputs.append(output)
-                    self.aborted_reqs.remove(req_id)
-
-                ## checkout output
-                for output in request_outputs:
-                    req_id = int(output.request_id)
-                    if self.sched_dict[req_id]["prefill_end"] is None:
-                        if DEBUG is not None:
-                            logger.info(f"step[{self.step}] | req[{req_id}] | prefill end: {now}")
-                        self.sched_dict[req_id]["prefill_end"] = now
-                        if not output.finished:
-                            self.sched_dict[req_id]["stats"] = \
-                                self.llm_runtime.output_processor.request_states[str(req_id)].stats
-                        finished_prefill_requests.append(req_id)
-                    if output.finished:
-                        self.sched_dict[req_id]["decode_end"] = now
-                        req = self.requests[req_id]
-                        finished_requests[req.idx] = output.outputs[0].token_ids
-                        self.sched_dict[req.idx]["num_output_token"] = len(output.outputs[0].token_ids)
+                request_outputs.extend(aborted_request_outputs)
+                ## checkout and update stats of output
+                ## finished_requests: key: request id , val: output tokens
+                ## finished_prefill_requests: list of request ids
+                finished_requests, finished_prefill_requests = self._check_and_update_stats(request_outputs, now)
 
                 ## process output async (if present)
                 if finished_requests or finished_prefill_requests:
-                    # check for previous output  processing task
+
                     if output_task is not None:
                         if DEBUG is not None:
                             logger.info(f"[DEBUG] step[{self.step}] | waiting output to be sent!")
                         await output_task
-                    finished_requests_ids = list(finished_requests.keys())
-
-                    self.requests_enqueued.difference_update(finished_prefill_requests)
-                    self.requests_running.update(finished_prefill_requests)
-                    self.requests_running.difference_update(finished_requests_ids)
-
-                    completed_requests = completed_requests + finished_requests_ids
-                    output_task = asyncio.create_task(
-                        self.process_outputs(finished_requests, finished_prefill_requests))
+                    output_task= self._async_output_process(finished_requests, finished_prefill_requests)
 
                 # self._assertions(request_outputs) # for debugging
-
                 ## check for more requests
-                in_read_signal = read_shared_var(self.sm_hold_shm)
+                in_read_signal = SharedMemoryManager.read_shared_var(self.sm_hold_shm)
                 if in_read_signal == 1:
                     self.add_requests()
-                    in_read_signal=0
-                    write_shared_var(self.sm_hold_shm, in_read_signal)
+                    self._reset_sm_hold_shm_val(val=0)
 
                 if request_outputs:
                     self._record_stats(request_outputs, elapsed)
@@ -390,7 +399,7 @@ class FineServeEngine:
             if output_task is not None:
                 await output_task
                 output_task = None
-            for _id in completed_requests:
+            for _id in self.completed_requests:
                 self.log_request(_id)
             self._print_stats()
 

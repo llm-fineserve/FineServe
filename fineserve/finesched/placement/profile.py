@@ -7,7 +7,10 @@ from fineserve.finesched.placement.constants import *
 
 
 class ProfileData:
+    """Class for handling profile data from performance measurements."""
+
     def __init__(self):
+        """Initialize ProfileData instance."""
         self.data = pd.DataFrame()
         self.column_dict = {
             "model": MODEL,
@@ -27,6 +30,15 @@ class ProfileData:
         self.all_categories = {}
 
     def query(self, q):
+        """
+        Query the profile data using a pandas query string.
+        
+        Args:
+            q: Query string
+            
+        Returns:
+            Query result as DataFrame
+        """
         return self.data.query(q, engine="python")
 
     def get(self,
@@ -39,6 +51,23 @@ class ProfileData:
             output_len: int = None,
             seq_len: int = None,
             verbose: bool = False):
+        """
+        Get data matching specified criteria.
+        
+        Args:
+            model: Model name
+            qformat: Quantization format
+            tp: Tensor parallelism degree
+            mps_percentage: MPS percentage
+            batch_size: Batch size
+            input_len: Input length
+            output_len: Output length
+            seq_len: Sequence length
+            verbose: Whether to print the query
+            
+        Returns:
+            Matching data as DataFrame
+        """
         q = self.build_query(
             model=model,
             qformat=qformat,
@@ -54,6 +83,15 @@ class ProfileData:
         return self.query(q)
 
     def build_query(self, **kwargs):
+        """
+        Build a query string from keyword arguments.
+        
+        Args:
+            **kwargs: Query parameters
+            
+        Returns:
+            Query string
+        """
         def to_value(v):
             if isinstance(v, int):
                 return str(v)
@@ -68,6 +106,15 @@ class ProfileData:
         return q
 
     def read_cost_file(self, cost_file: str):
+        """
+        Read cost data from CSV file.
+        
+        Args:
+            cost_file: Path to the cost CSV file
+            
+        Returns:
+            DataFrame with the cost data
+        """
         df = pd.read_csv(cost_file)
         # df[PROFILE_DATA_COLUMNS_CATEGORY] = df[PROFILE_DATA_COLUMNS_CATEGORY].astype("category")
         df[PROFILE_DATA_COLUMNS_NON_CATEGORICAL] = df[PROFILE_DATA_COLUMNS_NON_CATEGORICAL].astype(float)
@@ -79,6 +126,16 @@ class ProfileData:
 
 
 def build_cost_file(cost_file: str, profile_log_dir: str):
+    """
+    Build a cost file from profile log files.
+    
+    Args:
+        cost_file: Path to output cost CSV file
+        profile_log_dir: Directory containing profile log files
+        
+    Returns:
+        Combined DataFrame
+    """
     df = pd.DataFrame()
     for f in os.listdir(profile_log_dir):
         m = METRIC_LOG_FORMAT.match(f)
@@ -98,14 +155,18 @@ def build_cost_file(cost_file: str, profile_log_dir: str):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cost-file", type=str, default="examples/placement/cost.csv")
-    parser.add_argument("--profile-log-dir", type=str, default="examples/placement/profile_log")
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Build cost file from profile logs")
+    parser.add_argument("--cost-file", type=str, default="examples/placement/cost.csv",
+                        help="Output cost CSV file")
+    parser.add_argument("--profile-log-dir", type=str, default="examples/placement/profile_log",
+                        help="Directory containing profile log files")
     args = parser.parse_args()
     return args
 
 
-if __name__ == "__main__":
+def main():
+    """Main entry point for building cost files."""
     args = parse_args()
     build_cost_file(args.cost_file, args.profile_log_dir)
     pf = ProfileData()
@@ -132,3 +193,7 @@ if __name__ == "__main__":
     num = 1000
     t1 = timeit.timeit(f"pf.get(qformat='fp8', tp=4)", globals=globals(),  number=num)
     print(f">> querying performance: {t1/num * 1000:.3f} ms")
+
+
+if __name__ == "__main__":
+    main()

@@ -23,7 +23,7 @@ class LLM(abc.ABC):
         self.model = model
         self.model_type = model.split("/")[-1]
         self.model_size_org = model_size_org
-        self.activation_size_org = 3        # TODO:
+        self.activation_size_org = 3  # Base activation size in GB
         self.qformat = qformat
         self.quant = get_quant(qformat)
         self.rate = rate
@@ -47,15 +47,17 @@ class LLM(abc.ABC):
         self.slo_fixed = False
         self.tpt_config: ThroughputConfig = None
 
-        if self.model_size_org >= 60:           # TODO: appropriate condition?
+        # Determine base number of GPUs based on model size
+        if self.model_size_org >= 60:
             self.base_ngpu = 4
         elif self.model_size_org >= 30:
             self.base_ngpu = 2
         else:
             self.base_ngpu = 1
 
-        if self.qformat == 'awq':           # TODO: appropriate condition?
-            self.base_ngpu = max(self.base_ngpu/4, 1) 
+        # Adjust for AWQ quantization format
+        if self.qformat == 'awq':
+            self.base_ngpu = max(int(self.base_ngpu/4), 1)
 
         self.rate_scale = 1
 
@@ -98,16 +100,6 @@ class LLM(abc.ABC):
     @property
     def activation_size(self):
         return self.activation_size_org * (self.quant.activation.bit / 8)
-
-    def activation_size_per_batch(self, batch_size=None, seq_len=None):
-        if batch_size is None:
-            batch_size = 1
-        return self.activation_size_per_seq(seq_len) * batch_size
-
-    def activation_size_per_seq(self, seq_len=None):
-        if seq_len is None:
-            seq_len = self.avg_output_len + self.avg_input_len
-        return self.activation_size_per_token * seq_len
 
     @property
     def activation_size_per_token(self):

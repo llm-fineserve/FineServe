@@ -5,6 +5,7 @@ from fineserve.finesched.placement.mesh_group import MeshGroup, GPU
 
 
 class Cluster(abc.ABC):
+    """Abstract base class for cluster representations."""
 
     def __init__(self,
                  nnodes: int,
@@ -12,6 +13,16 @@ class Cluster(abc.ABC):
                  memory_per_gpu: int,
                  overload_threshold: int,
                  gpu_memory_utilization: float):
+        """
+        Initialize a cluster object.
+        
+        Args:
+            nnodes: Number of nodes in the cluster
+            ngpus_per_node: Number of GPUs per node
+            memory_per_gpu: Memory per GPU in GB
+            overload_threshold: Overload threshold for GPUs
+            gpu_memory_utilization: GPU memory utilization factor
+        """
         self.nnodes = nnodes
         self.ngpus_per_node = ngpus_per_node
         self.memory_per_gpu = memory_per_gpu
@@ -20,10 +31,14 @@ class Cluster(abc.ABC):
 
         self.ngpus = self.nnodes * self.ngpus_per_node
         self.total_memory = self.ngpus * self.memory_per_gpu
+        
+        # Create GPUs
         self.gpus = [
             GPU(rank, self.memory_per_gpu, 100, self.overload_threshold)
             for rank in range(self.nnodes * self.ngpus_per_node)
         ]
+        
+        # Group GPUs into nodes
         self.nodes = [
             MeshGroup(self.gpus[ngpus_per_node * node_idx:
                                 ngpus_per_node * (node_idx + 1)],
@@ -33,12 +48,24 @@ class Cluster(abc.ABC):
 
 
 class FineServeCluster(Cluster):
+    """FineServe cluster implementation."""
+    
     def __init__(self,
                  nnodes: int,
                  ngpus_per_node: int,
                  memory_per_gpu: int,
                  overload_threshold: int,
                  gpu_memory_utilization: float):
+        """
+        Initialize a FineServe cluster.
+        
+        Args:
+            nnodes: Number of nodes in the cluster
+            ngpus_per_node: Number of GPUs per node
+            memory_per_gpu: Memory per GPU in GB
+            overload_threshold: Overload threshold for GPUs
+            gpu_memory_utilization: GPU memory utilization factor
+        """
         super().__init__(nnodes,
                          ngpus_per_node,
                          memory_per_gpu,

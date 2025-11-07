@@ -28,14 +28,15 @@ class GPU:
         return self.free_mps < 0
 
     def can_place(self, llm: LLM, mps: int, tp_size: int):
-        if self.free_memory < llm.required_memory / tp_size:
-            return False
-        return True
-
+        # Estimate required memory per GPU for this model
+        model_memory_per_gpu = (llm.model_size + llm.activation_size) / tp_size
+        return self.free_memory >= model_memory_per_gpu
 
     def place_model(self, llm: LLM, mps: int, tp_size: int = 1):
         self.models.append((llm, mps))
-        self.free_memory -= llm.required_memory / tp_size
+        # Deduct estimated memory usage
+        model_memory_per_gpu = (llm.model_size + llm.activation_size) / tp_size
+        self.free_memory -= model_memory_per_gpu
         self.free_mps -= mps
         llm.place(self.rank)
 
@@ -44,7 +45,7 @@ class GPU:
                 f"rank={repr(self.rank)}, "
                 f"total_memory={repr(self.total_memory)}, "
                 f"free_memory={repr(self.free_memory)}, "
-                f"gpu_memory_utilization={repr(self.memory_utilization)}, "
+                f"memory_utilization={repr(self.memory_utilization)}, "
                 f"total_mps={repr(self.total_mps)}, "
                 f"free_mps={repr(self.free_mps)}, "
                 f"overload_threshold={repr(self.overload_threshold)}, "
@@ -54,6 +55,7 @@ class GPU:
 
 
 class MeshGroup:
+    """Mesh: a group of GPU that serves a set of LLMs"""
 
     def __init__(self,
                  gpus: list[GPU],
@@ -85,20 +87,18 @@ class MeshGroup:
     def models(self):
         return set(sum([g.models for g in self.gpus], []))
 
-    def can_place(self, llm: LLM, mps: int):
-        return np.all([gpu.can_place(llm, mps, self.ngpus) for gpu in self.gpus])
+    def can_place(self, llm: LLM, mps: int, tp_size: int = 1):
+        return np.all([gpu.can_place(llm, mps, tp_size) for gpu in self.gpus])
 
-    def place_model(self, llm: LLM, mps: int):
+    def place_model(self, llm: LLM, mps: int, tp_size: int = 1):
         for gpu in self.gpus:
-            gpu.place_model(llm, mps, self.ngpus)
-        # self.models.append((llm, mps))
+            gpu.place_model(llm, mps, tp_size)
 
     def __repr__(self) -> str:
         return (f"MeshGroup("
                 f"ngpus={repr(self.ngpus)}, "
                 f"gpus={repr(sorted([g.rank for g in self.gpus]))}, "
-                # f"gpu_memory_utilization={repr(self.gpu_memory_utilization)}, "
-                f"gpu_memory={repr(self.total_memory)}, "
-                f"free_gpu_memory={repr(self.free_memory)}, "
+                f"total_memory={repr(self.total_memory)}, "
+                f"free_memory={repr(self.free_memory)}, "
                 f"models={repr(self.models)}"
                 f")")
