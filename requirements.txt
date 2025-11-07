@@ -1,3 +1,5 @@
 aiohttp
 zmq
 ruamel.yaml
+torchvision==0.22
+pydantic==2.10.0
